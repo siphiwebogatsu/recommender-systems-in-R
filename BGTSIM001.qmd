@@ -1,0 +1,873 @@
+---
+title: "Recommender Systems"
+author: "Siphiwe Bogatsu"
+date: "09/25/2024"
+format: 
+  html:
+    fig-width: 8
+    fig-height: 4
+    code-fold: true
+---
+
+## Introduction
+
+"Is YouTube listening to us?!" my close friend, Qhawe, often exclaims in disbelief when YouTube recommends videos that perfectly match their tastes. This sentiment reflects a broader reality: many of our digital interactions are stored and analyzed, giving researchers the chance to study socio-economic and techno-social systems in greater detail (Lu et al., 2019). Recommendation systems, like those used by YouTube and other tech giants, are designed to predict user preferences based on past behavior. These systems play a crucial role in e-commerce and streaming platforms such as Netflix, YouTube, and Amazon, where making accurate recommendations increases user satisfaction and engagement, ultimately driving sales and profit growth. Companies competing for customer loyalty rely heavily on systems that analyze user preferences to offer products and services most likely to appeal to them.
+
+There are two main types of recommendation systems:
+
+-   Content-based recommendation systems
+
+-   Collaborative filtering (user-based and item-based)
+
+Additionally, matrix factorization is a key technique used in collaborative filtering.
+
+![](images/clipboard-3598980764.png){fig-align="center"}
+
+In this project, I focus on collaborative filtering and matrix factorization techniques to build an ensemble recommendation system for books. The goal is to recommend books based on users' past reading choices. This paper is structured as follows.
+
+## Load Packages
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+pacman::p_load("tidyverse", "skimr", "Metrics", "recosystem", "tools", "caret")
+```
+
+## Books Dataset
+
+The data was collected by Cai-Nicolas Ziegler in 2004 from a [Book Crossing Community](https://www.bookcrossing.com/). It contains 278 878 users with 1 149 780 ratings. It is divided into three subsets: users, books and ratings. Let's start with books
+
+### Data Preparation
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+books   = read.csv("Books.csv")
+
+knitr::kable(
+books |> head(3)
+)
+
+# exclude the images variables
+books = books |> select(ISBN,
+                        Book.Title,
+                        Book.Author,
+                        Year.Of.Publication,
+                        Publisher)
+
+# change to lowercase. it makes life easier
+books$Book.Title  = books$Book.Title |> str_to_lower()
+books$Book.Author = books$Book.Author |> str_to_lower()
+books$Publisher   = books$Publisher |> str_to_lower()
+
+```
+
+Books data contains *ISBN*, *Book Title*, *Book Author*, *Publication Year*, *Publishing Company* and images as its variables to describe a book observation.
+
+Let's do some wrangling on interesting variables
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# Looks like year of publication has some issues: "dk publishing inc" and "gallimard" issue. 
+books |> filter(Year.Of.Publication == "dk publishing inc")
+
+books$Publisher[books$Publisher %in%
+                  c("http://images.amazon.com/images/P/078946697X.01.THUMBZZZ.jpg",
+                    "http://images.amazon.com/images/P/0789466953.01.THUMBZZZ.jpg")] = "dk publishing inc"
+
+## Put the correct date 
+books$Year.Of.Publication[books$Year.Of.Publication == "dk publishing inc"] = "2000"
+books|> filter(Publisher == "dk publishing inc" & Book.Author == "2000")
+
+## Some author variables had "2000" instead of the correct names. 
+books$Book.Author[books$Book.Author %in% "2000" & books$ISBN %in% "078946697X" ] = "michael teitelbaum"
+books$Book.Author[books$Book.Author %in% "2000" & books$ISBN %in% "0789466953" ] = "james buckley"
+
+books$Book.Title[books$Book.Author %in% "michael teitelbaum" & books$ISBN %in% "078946697X" ] = "DK Readers: Creating the X-Men, How It All Began (Level 4: Proficient Readers)"
+books$Book.Title[books$Book.Author %in% "james buckley" & books$ISBN %in% "0789466953" ] = "DK Readers: Creating the X-Men, How Comic Books Come to Life (Level 4: Proficient Readers)"
+
+
+knitr::kable(
+books |> filter(Publisher == "dk publishing inc") |> head(5)
+)
+
+
+## gallimard now. 
+books |> filter(Year.Of.Publication == "gallimard")
+books$Publisher[books$Publisher %in% c("http://images.amazon.com/images/P/2070426769.01.THUMBZZZ.jpg",
+                                     "http://images.amazon.com/images/P/2070426769.01.THUMBZZZ.jpg")] = "gallimard"
+
+books$Year.Of.Publication[books$Year.Of.Publication == "gallimard"] = "2003"
+
+books|> filter(Publisher == "gallimard" & Book.Author == "2003")
+
+books$Book.Author[books$Book.Author %in% "2003" & books$ISBN %in% "2070426769" ] = "Jean-Marie Gustave Le ClÃ?Â©zio"
+
+books$Book.Title[books$Book.Author %in% "Jean-Marie Gustave Le ClÃ?Â©zio" & books$ISBN %in% "2070426769" ] = "Peuple du ciel, suivi de 'Les Bergers"
+
+knitr::kable(
+books |> filter(Publisher == "gallimard") 
+      |> head(5)
+)
+
+```
+
+The data was published in August/September 2004. Thus, any publication year above that should be dealt with: anything beyond 2005 should be given an NA, and impute the mean year of the whole data set.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+books$Year.Of.Publication = books$Year.Of.Publication |> as.numeric()
+
+books = books |>
+  mutate(Year.Of.Publication = ifelse(Year.Of.Publication == 0 | Year.Of.Publication >= 2005, NA, Year.Of.Publication))
+
+# replace NAs with the mean of the years of publication 
+books = books |>
+  mutate(Year.Of.Publication = ifelse(is.na(Year.Of.Publication),
+                                      round(mean(Year.Of.Publication, na.rm = TRUE)), 
+                                      Year.Of.Publication))
+
+# check 
+books |> filter(is.na(Year.Of.Publication)) |> sum()
+```
+
+Let's move to the *Publisher* variable now.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+## are there NAs in the publisher column ? 
+
+books$Publisher[books$Publisher |> is.na()]
+
+```
+
+Okay. Enough about the **Books** data for a minute. Let me load the **Users** data.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+users = read.csv("users.csv")
+
+# how is age distributed for our users ?
+users |> ggplot(aes(Age)) + 
+  geom_histogram(color = "magenta", bins = 30) +
+  labs(y = "Count", 
+       x = "Age in years", 
+       title = "Some users are less than 5 years old and some are even over 100 years?!")
+
+# That's kinda sus. To be safe, I remove these. 
+users = users |> 
+                 filter(Age >= 10 & Age <= 100)
+
+# replace all the NAs with the mean of Age 
+users = users |> mutate(
+                  Age = ifelse(is.na(Age), 
+                               round(mean(Age, na.rm = TRUE)), 
+                               Age)
+)
+
+# check 
+users |> filter(is.na(Age)) |> sum()
+
+# box plot? 
+users |> ggplot(aes(Age)) + geom_boxplot(fill = "magenta")
+```
+
+The mean *age* is around 30 years old. Most of the book readers lie between the ages of 25 to little less than 45 years old - which is kind of expected.
+
+Let's add the Ratings data. This will have *n_users\*n_books* entries if every user rated every item. From this, I can confidently speculate that the dataset is very sparse
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+ratings = read.csv("ratings.csv")
+skim(ratings)
+```
+
+Let's merge our all the three data sets.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# let's merge books and ratings. ratings dataset should have books only which exist in our books dataset, unless new books are added to books dataset
+
+ratings_new = inner_join(ratings, books)
+
+#ratings dataset should have ratings from users which exist in users dataset, unless new users are added to users dataset
+ratings_new = inner_join(users, ratings_new)
+
+knitr::kable(ratings_new |> head(5))
+
+```
+
+-   When merging the ratings and books data, there is evidence that some ratings did not have books on them. They eventually got dropped off.
+-   When merging the ratings(plus books) data, there is evidence that some users did not have ratings on them. They eventually got dropped off.
+
+Ratings are either explicit, expressed on a scale from 1-10 higher values denoting higher appreciation, or implicit, expressed by 0. Just for ease, I focus only on books with users that gave explicit ratings.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+# split according to explicit and implicit ratings. 
+ratings_explicit = ratings_new |> filter(Book.Rating != 0)
+ratings_implicit = ratings_new |> filter(Book.Rating == 0)
+
+# bar graph for explicit ratings 
+ratings_explicit |> ggplot(aes(Book.Rating)) + geom_bar(fill = "green") +
+  labs(y = "Count", 
+       x = "Book Rating",
+       title = "Users appear to mostly enjoy the books they read.")
+  
+
+```
+
+```{r include=FALSE}
+countries = str_extract(ratings_explicit$Location, "[^,]+$")
+ratings_explicit = data.frame(ratings_explicit,countries)
+```
+
+## What are the top 10 most popular books ?
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+knitr::kable(
+ratings_explicit |> group_by(Book.Title) |>
+                             summarise(count = sum(Book.Rating)) |> 
+                             arrange(desc(count)) |> head(10)|>
+                             select(Book.Title, count)
+)
+
+
+```
+
+## Which publishing companies are rated most popular ?
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+pub_companies = ratings_explicit |> group_by(Publisher) |>
+                             summarise(count = sum(Book.Rating)) |> 
+                             arrange(desc(count)) |> head(20)
+
+knitr::kable(pub_companies)
+```
+
+[Ballantine Books](https://www.randomhousebooks.com/imprint/ballantine-books/) and [Pocket Books](https://en.wikipedia.org/wiki/Pocket_Books) are rated popular by our users.
+
+## Which books did Ballantine Books publish ? Which one is the highly-rated by the users ?
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+knitr::kable(
+ratings_explicit |> filter(Publisher == "ballantine books") |> 
+                     group_by(Book.Title) |>
+                     summarise(count = sum(Book.Rating)) |> 
+                     arrange(desc(count)) |> head(10)
+)
+ 
+```
+
+Interview With The Vampire by Anna Rice and Jurassic Park by Michael Crichton are among the highly rated books published under Ballantine Books - the highly-rated publisher in the data.
+
+## Who is the highly-rated author and which books they wrote ?
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+ratings_explicit |> 
+  group_by(Book.Author) |> 
+  summarise(count = sum(Book.Rating)) |> 
+  arrange(desc(count)) |> 
+  head(10) |>
+  ggplot(aes(x = Book.Author, y = count)) +
+  geom_col() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = "Author", 
+       y = "User Rating Count",
+       title = "Stephen King, ahead of John Grisham, is the user's favorite book author!")
+```
+
+### What books did Stephen King publish, and how are they rated ?
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+stephen = ratings_explicit |> filter(Book.Author == "stephen king") |> 
+                            group_by(Book.Title) |>
+                            summarise(count = sum(Book.Rating)) |> 
+                            arrange(desc(count)) |> head(10) |>
+                            select(Book.Title, count) |>
+                            ggplot(aes(x = Book.Title, y = count)) +
+                               geom_col( fill = "magenta") +
+                               theme(axis.text.x = element_text(angle = 45, hjust = 1)) + labs( x = "Book Title", 
+           y = "User Rating Count",
+           title = "Stephen King's books are recieved by users in roughly the same manner",
+           subtitle = "Dream Catcher (Science Fiction) and Misery (Horror) are the top-rated books in his shelf")
+
+stephen    
+      
+```
+
+### Which publisher of Stephen King's books is highly rated ?
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+ratings_explicit |> filter(Book.Author == "stephen king") |>
+                    group_by(Publisher) |> 
+                    summarise(count = sum(Book.Rating)) |>
+                    arrange(desc(count)) |>
+                    head(10) |>
+                    ggplot(aes(x = Publisher, y = count)) +
+                    geom_col(fill = "gold") +
+                    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+                    labs(x = "Publisher", 
+                         y = "User Rating Count",
+                         title = "Signet Book has published Stephen King's highly-rated books.")
+                 
+```
+
+But, wait...What if this observation could be explained by Signet Book publishing many of Stephen King's books than any other publisher?
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+ratings_explicit |> filter(Book.Author == "stephen king") |>
+                    group_by(Publisher) |>
+                    summarise(book_count = n()) |> 
+                    arrange(desc(book_count)) |>
+                    head(10)
+```
+
+You see. Signet Book has published many of Stephen King's highly rated books. This partly explains the high rating among the users.
+
+## Which year of publication is highly rated ?
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+ratings_new |> group_by(Year.Of.Publication) |>
+               summarise(count = sum(Book.Rating)) |>
+               arrange(desc(count))|> head(20) |>
+               ggplot(aes(x = Year.Of.Publication, y = count)) + 
+               geom_col(fill = "red") + 
+               labs(x = "Publication Year", 
+                    y = "User Rating Count", 
+                    title = "Readers highly rate recently published books more")
+```
+
+## What books do youth read and enjoy ? What about the old-aged user ?
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+ratings_new |>
+                 filter(Age >= 18 & Age <= 40) |>
+                 group_by(Book.Title) |>
+                 summarise(count = sum(Book.Rating)) |> 
+                 arrange(desc(count)) |>
+                 head(10) |>
+                 ggplot(aes(x = Book.Title, y = count)) + 
+                 geom_col(fill = "gold") +
+                  theme(axis.text.x = element_text(angle = 50, hjust = 1)) +
+                  labs(x = "Book Title", 
+                       y = "User Rating Count",
+                   title = "Youth readers prefer mystery, fantasy and coming-of-age books")
+
+# old people?
+ratings_new |>
+                 filter(Age >= 41) |>
+                 group_by(Book.Title) |>
+                 summarise(count = sum(Book.Rating)) |> 
+                 arrange(desc(count)) |>
+                 head(10) |>
+                 ggplot(aes(x = Book.Title, y = count)) +
+                  geom_col(fill = "brown") +
+                  theme(axis.text.x = element_text(angle = 50, hjust = 1)) +
+                  labs(x = "Book Title", 
+                       y = "User Rating Count",
+                       title = "Old readers prefer historical, military fiction and war books")
+
+```
+
+Looking across the youth and old users, The Lovely Bones by Alice Sebold and The da Vinci Code by Dan Brown are the commonly read and enjoyed books.
+
+## User-Based Collaborative Filtering
+
+This approach operates on a premise that users who gave a similar ratings to a certain book are likely to have the same preference for other books as well. Therefore, this method relies heavily on finding similarity between users. The workflow below illustrates user to user collaborative filtering:
+
+![User to user CF](images/clipboard-3454811298.png){fig-align="center"}
+
+### Subset the data first, then use it to all three approaches.
+
+The dataset is quite huge as you have noticed. It was decided to subset it such that we focus on top 100 books from top 20 publishing companies, and our users are American Youth (18 to 35 years old)
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# top 20 books from top 20 publishing companies
+new_books  = ratings_explicit |> filter(Publisher %in% pub_companies$Publisher) |> 
+                    group_by(Book.Title) |>
+                             summarise(count = sum(Book.Rating)) |> 
+                             arrange(desc(count)) |> head(50)|>
+                             select(Book.Title, count)
+
+final_book = ratings_explicit |> filter(Book.Title %in% new_books$Book.Title) |>
+                    filter(Age >= 18 & Age <= 35) |> 
+                    filter(countries == " usa")
+
+# Check if any users rated the same book multiple times
+duplicates <- final_book |> 
+                      select(User.ID,Book.Title,Book.Rating) |> 
+                      group_by(User.ID, Book.Title) |>
+                      filter(n() > 1)
+
+# remove the duplicates by averaging over the book ratings 
+final_book = final_book |> 
+                   group_by(User.ID, Book.Title) |>
+                   summarize(Book.Rating= mean(Book.Rating, na.rm = TRUE)) |>
+                   ungroup() 
+
+
+# Pivot the data to be wider format
+ratings_wider = final_book |> 
+  pivot_wider(names_from = Book.Title, 
+              values_from = Book.Rating, 
+              values_fill = list(Book.Rating = 0)) |> as.matrix()
+
+```
+
+### Cosine similarity function
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+cosine_sim <- function(a, b) {
+  crossprod(a, b) / sqrt(crossprod(a) * crossprod(b))
+}
+
+```
+
+### Construct the user similarities matrix
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+user_similarities = function(data){
+  
+  
+  
+  # construct an empty matrix
+  user_similarities = matrix(0, nrow = nrow(data), ncol = nrow(data))
+  
+  # compute cosine similarity for between users
+  for(i in 1:(nrow(data) - 1)){
+  
+    for(j in (i + 1):nrow(ratings_wider)){
+    user_similarities[i, j] <- cosine_sim(data[i, ], data[j, ])
+    }
+    
+  }
+  # arrange the user similarity matrix 
+  user_similarities            <- user_similarities + t(user_similarities)
+  diag(user_similarities)      <- 0
+  row.names(user_similarities) <- data[,1]
+  colnames(user_similarities)  <- data[,1]
+  
+  # round to 4 decimal places
+  user_similarities = user_similarities |> round(4)
+  
+  # return the dataframe
+  return(user_similarities|> as.data.frame())
+}
+
+# print the user similarities to check?
+knitr::kable(user_similarities(ratings_wider)[c(1,2),c(1,2)])
+
+```
+
+### Build a UU recommender function
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# build a recommender function that takes the userID and wide ratings data 
+
+UU_recommender = function(userID, data,min_rating = 0, max_rating = 10){
+  
+  
+  if(userID %in% unique(as.data.frame(data)$User.ID)){
+    
+    user_scores <- data.frame(
+  
+                title = colnames(data),
+                
+                score = as.vector(
+                  as.matrix(user_similarities(data)[userID, ]) %*% data),
+                
+                read = as.vector(data[which(data[,"User.ID"] == userID), ])
+      )
+    
+    
+    # Normalize the scores between [min_rating, max_rating]
+    min_score <- min(user_scores$score, na.rm = TRUE)
+    max_score <- max(user_scores$score, na.rm = TRUE)
+    
+    user_scores$USB.Rating <- round((user_scores$score - min_score) * 
+                                    ((max_rating - min_rating) / (max_score - min_score))*100000,0)
+    
+                    
+    
+    # Return recommendations, incl. those read
+    return(user_scores |>
+               arrange(desc(USB.Rating))
+    )
+    
+  } else{
+    
+    print("User not found in our database. Try again!")
+  }
+  
+}
+```
+
+### Recommend a new book using User-User CF to a user
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# recommend books to user 2399
+knitr::kable(
+UU_recommender("2399", ratings_wider) |>
+  filter(read == 0)|>
+  select(-read))
+```
+
+User 2399 might enjoy **excessive** amounts of Harry Potter books.
+
+## Item-Based Collaborative Filtering
+
+The previous approach assumed that users are the same! Which is quite incorrect. On top of that, in some cases, user preference might be too abstract to break down. This is where item-based CF can be useful. Here, the basic idea is that Book **A** is similar to Book **B** if users who see **A** also tend to see **B.**
+
+Similarity between books is used instead of similarity between users.
+
+We first need to convert the data to matrix form otherwise some of the later functions we use will give an error.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+# Pivot the data
+ratings_wider_item = final_book |> 
+  select(User.ID, Book.Title, Book.Rating) |>
+  pivot_wider(names_from = Book.Title, 
+              values_from = Book.Rating, 
+              values_fill = list(Book.Rating = 0))
+
+sorted_my_users <- as.character(unlist(ratings_wider_item[, 1]))
+ratings_wider_item  <- as.matrix(ratings_wider_item[, -1])
+row.names(ratings_wider_item) <- sorted_my_users
+
+
+```
+
+### Construct the item similarities matrix
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+# create an empty matrix
+item_similarities = matrix(0, nrow = ncol(ratings_wider_item), ncol = ncol(ratings_wider_item))
+  
+  # compute similarities between items
+for(i in 1:(ncol(ratings_wider_item) - 1)){
+  
+    for(j in (i + 1):ncol(ratings_wider_item)){
+      
+      item_similarities[i, j] <- cosine_sim(ratings_wider_item[, i], ratings_wider_item[, j])
+    }
+}
+
+# arrange the book similarity matrix 
+item_similarities            <- item_similarities + t(item_similarities)
+diag(item_similarities)      <- 0
+row.names(item_similarities) <- colnames(ratings_wider_item)
+colnames(item_similarities)  <- colnames(ratings_wider_item)
+
+knitr::kable(
+  round(item_similarities[c(1,2),c(1,2)],2)
+)
+
+```
+
+### Build a Item-Item recommendation function for any user
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+II_recommender <- function(ratings, user, book_sim, read_bk,
+                           min_rating = 0,max_rating = 10) {
+  
+  # turn into character, if not already
+  user <- ifelse(is.character(user), user, as.character(user))
+
+  # get scores
+  user_read <- ratings |>
+                      filter(User.ID == user) |>
+                      pull(Book.Title)
+  
+  
+  if(length(user_read) == 1){
+    
+    user_scores <- tibble(
+    title = row.names(book_sim),
+    score = book_sim[, user_read],
+    read = read_bk[user, ]
+    )
+    
+  }
+  else{
+    
+    user_scores <- tibble(
+    title = row.names(book_sim),
+    score = apply(book_sim[, user_read], 1, sum),
+    read = read_bk[user, ]
+    )
+  }
+        # Normalize the scores between [min_rating, max_rating]
+  min_score <- min(user_scores$score, na.rm = TRUE)
+  max_score <- max(user_scores$score, na.rm = TRUE)
+    
+  user_scores$ITB.Rating <- round((user_scores$score - min_score) * 
+                                    ((max_rating - min_rating) / (max_score - min_score)),0)
+    
+        # Return recommendations. incl. the ones read. 
+    return(user_scores |>
+    arrange(desc(ITB.Rating))
+    )
+    
+}
+```
+
+We can use this similarity matrix to discover which books are similar to "iInterview with the Vampire".
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+knitr::kable(
+item_similarities[, "interview with the vampire"] |>
+  sort(decreasing = TRUE) |> 
+  data.frame(similarity = _) |> head(10)
+)
+
+```
+
+Interview with the Vampire (IwV) by Anna Rice, published in 1976 is *quite* similar to The Vampire Lestat (TVL) and Harry Potter books. So if a user prefers IwV, you would recommend Harry Potter's books and the TVL. TVL mostly.
+
+### Book recommendations using Item-Item CF
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# recommend books to user 2399
+knitr::kable(
+II_recommender(ratings = final_book,
+                           user = "2399", 
+                           book_sim = item_similarities, 
+                           read_bk = ratings_wider_item) |> 
+                           filter(read == 0)    ## books they haven't read
+)
+```
+
+Still. User 2399 might relatively enjoy more of TVL. At times, suggest Harry Potter's books. They might *somewhat* have a taste there.
+
+## Matrix Factorization CF
+
+This method is a contrast to user and item-based filtering through a creation of predictive machine learning model of the data. The method uses present values in the user-item matrix as the training data set and produces predictions for missing values with the resultant model.
+
+Essentially, matrix factorization algorithms work by decomposing the user-item interaction (book ratings in our case) into the product of two lower dimensionality matrices called factors, i.e., user and book factors: the idea is to represent users and items in a lower dimensional space.
+
+To do this, [*recosystem*](https://rdrr.io/cran/recosystem/f/vignettes/introduction.Rmd) package is used to apply this algorithm. Firstly, the package requires that UserID and ISBN should be integers starting at 0 or 1.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+userIds = data.frame(User.ID = unique(final_book$User.ID),
+                        new_userId = 0:(length(unique(final_book$User.ID)) - 1))
+
+bookIds = data.frame(Book.Title = unique(final_book$Book.Title),
+                        new_bookId = 0:(length(unique(final_book$Book.Title)) - 1))
+
+
+final_book = final_book |>
+                  left_join(userIds) |>
+                  left_join(bookIds)
+
+knitr::kable(
+final_book |> select(User.ID = new_userId, 
+                     Book.ID = new_bookId, 
+                     Book.Title,
+                     Book.Rating) |> head(5)
+)
+
+```
+
+### Split the data into training and test set
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+set.seed(1)
+set   = sample(1:nrow(final_book), size = 0.8*nrow(final_book))
+train = final_book[set,]
+test  = final_book[-set, ]
+```
+
+### Train and predict on a test set
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+# Format data for recosystem
+reco_train <- data_memory(
+    user_index = train$new_userId,
+    item_index = train$new_bookId,
+    rating = train$Book.Rating
+  )
+  
+reco_test <- data_memory(
+    user_index = test$new_userId,
+    item_index = test$new_bookId,
+    rating = test$Book.Rating
+  )
+  
+# Initialize Reco model
+rs <- Reco()
+
+# Tune model for hyperparameters on training data
+opts <- rs$tune(reco_train, opts = list(
+    dim = c(10, 25, 50, 75),        # the dimensions of the latent factor matrices
+    lrate = c(0.1, 0.01),
+    niter = 20,
+    nmf = TRUE, 
+    nthread = 4
+  ))
+  
+# Train the model with optimal hyperparameters
+rs$train(reco_train, opts = list(
+    opts$min,
+    niter = 50, 
+    nthread = 4,
+    verbose = FALSE
+  ))
+  
+# Make predictions on the test set for this fold
+MF_pred <- rs$predict(reco_test)
+
+# prediction 
+pred_data <- test |> 
+  mutate(MF.Rating = MF_pred |> round(1)) 
+  
+
+knitr::kable(
+pred_data |> head(10)
+)
+
+
+```
+
+### Assess accuracy on the test set
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+evaluation <- tibble(Model = "Matrix CF",
+                      MAE  = round(Metrics::mae(test$Book.Rating, MF_pred),2),
+                      MSE  = round(Metrics::mse(test$Book.Rating, MF_pred),2),
+                      RMSE = round(Metrics::rmse(test$Book.Rating, MF_pred),2))
+
+knitr::kable(evaluation)
+
+```
+
+### Build a regularized matrix factorization CF
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# Initialize Reco model
+rs <- Reco()
+
+# Tune model for hyperparameters on training data
+opts <- rs$tune(reco_train, opts = list(
+  
+dim = c(10, 25, 50, 75),
+lrate = c(0.1, 0.01, 0.001),
+niter = 20,
+nmf     = TRUE, 
+nthread  = 4, 
+costp_l2 = c(1, 0.5, 0.25, 0.1, 0.01), # the L2 regularization cost for user factors
+costq_l2 = c(1, 0.5, 0.25, 0.1, 0.01)  # the L2 regularization cost for book factors
+    
+  ))
+  
+# Train the model with optimal hyperparameters
+rs$train(reco_train, opts = list(
+    opts$min,
+    niter = 50, 
+    nthread = 4,
+    verbose = FALSE
+  ))
+  
+# Make predictions on the test set for this fold
+MF_pred <- rs$predict(reco_test)
+
+# prediction 
+pred_data <- test |> 
+  mutate(MF.Rating = MF_pred |> round(1)) 
+
+```
+
+### Assess accuracy with regularization
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+evaluation <- bind_rows(evaluation, tibble(Model = "regularised Matrix CF",
+                      MAE  = round(Metrics::mae(test$Book.Rating, MF_pred),2),
+                      MSE  = round(Metrics::mse(test$Book.Rating, MF_pred),2),
+                      RMSE = round(Metrics::rmse(test$Book.Rating, MF_pred),2)))
+
+knitr::kable(evaluation)
+
+```
+
+-   It appears if you regularize the matrix CF, the model performance slightly improves on all metrics. But, this is not a full picture, as this is was done on one test set.
+
+## Ensemble the predictions from User-User, Item-Item and Matrix CF
+
+To do this, we get predictions of all the three approaches from a single user, and then get the average. This is will be the ensemble predicted rating of a particular book for that user.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# find a user from within the test predictions of matrix factorization method
+MF_data = pred_data |> 
+             filter(User.ID == "13552")
+
+# recommend books to user 2399 and get prediction from the normalised scores
+item = II_recommender(ratings = final_book,
+                           user = "13552", 
+                           book_sim = item_similarities, 
+                           read_bk = ratings_wider_item) |>
+                                  select(title,ITB.Rating)
+
+user = UU_recommender("13552", ratings_wider) |> 
+                   select(title, USB.Rating)
+
+# join the three approaches for user 2399
+item_user    = inner_join(item, user) |> rename(Book.Title = title)
+item_user_mf = inner_join(item_user,MF_data, by = "Book.Title")
+
+
+# Assuming the dataframe is named books_ratings
+
+item_user_mf$ensemble_model =  round(rowMeans(item_user_mf[, c("ITB.Rating", 
+                                                                "USB.Rating",
+                                                                "MF.Rating")], na.rm = TRUE))
+
+item_user_mf = item_user_mf |> select(-Book.Rating)
+
+# get the average true rating for that book. 
+mean_rating = ratings_explicit |>
+  group_by(Book.Title) |>
+  mutate(mean_rating = round(mean(Book.Rating))) |>
+  select(mean_rating) |> unique()
+
+final_models = inner_join(mean_rating, item_user_mf , by = "Book.Title")
+
+```
+
+-   Here, this ensemble method proposed seems to by chance, because it's quite hard to find the same user-book interaction from the three approaches simultaneously.
+
+-   The data is sampled when splitting into a test set, and then again when recommendations are being done. This makes quite impossible to match the user-book interaction. It can only happen by chance.
+
+-   Maybe there is another way to do this. I am open to learning it.
+
+### Evaluate the accuracy of the ensemble predictions
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+# evaluation 
+evaluation <- bind_rows(evaluation, tibble(Model = "Ensemble Model",
+                      MAE  = Metrics::mae(final_models$mean_rating, final_models$ensemble_model),
+                      MSE  = Metrics::mse(final_models$mean_rating, final_models$ensemble_model),
+                      RMSE = Metrics::rmse(final_models$mean_rating, final_models$ensemble_model)))
+
+
+
+knitr::kable(evaluation)
+```
+
+From the table above, one can see that the ensemble predictions perform quite badly compared to the matrix factorization CF. It could be as a result of the two other approaches. But, also notice that the accuracy of the ensemble is based one user - it could be performing worse on that particular user and not generally on all users.
+
+## Conclusion
+
+This project attempts in great length the process of building a recommender system using three approaches: user and item-based collaborative filtering and matrix factorization (MF) algorithm. The dataset comes from the [Book Crossing Community](https://www.bookcrossing.com/), and its manipulated to find key insights, such as which books youth users in the community enjoy reading, and how is that different from older aged users - among other things. From these insights, we end up sub-setting the data towards information about youth (18-35 years old) Americans.
+
+It is learned that when you regularize an MF algorithm, one could improve rating predictions, though marginally. At the end, an ensemble prediction is constructed for one user. It yields worse results for this particular user. Possibly, this is an impact of the user-user and item CFs in the ensemble.
+
+We could improve on assessing how the change in MF's latent factors' dimensionality affects out of sample model performance. One could also explore how sensitive the model is to sampling variation and how accuracy changes with the number of users (and/or items) the model is based. Lastly, the ensemble prediction could include more users - one user is simply not enough to make robust conclusions.
+
+## Acknoweledgements
+
+This recommendation system project was in close collaboration. Data Science project done isolation are painful. A special gratitude to Hlalumi Adams to accept to explore creative frontiers together.
+
+## References
+
+Aggarwal, C.C., 2016. *Recommender systems (Vol. 1)*. Cham: Springer International Publishing.
+
+Calder, J. 2024. *Recommender Systems.* University of Cape Town. 28 August 2024.
+
+Motefaker, A., 2024. *Movie Recommendation System using R* *- BEST*. Available at: https://www.kaggle.com/code/amirmotefaker/movie-recommendation-system-using-r-best/notebook#What-is-Movie-Recommendation? (Accessed: 25 September 2024)
